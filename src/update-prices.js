@@ -2,22 +2,19 @@
 /**
  * update-prices.js
  *
- * Fetches today's gold & silver spot prices from goldapi.io,
- * recalculates material costs for each ring in the catalog,
- * and writes output/quote-table.html (Squarespace-ready).
+ * Fetches today's Stuller price-per-DWT for each ring SKU, applies the
+ * markup multiplier, and writes output/quote-table.html (Squarespace-ready).
  *
- * Usage:
- *   GOLDAPI_KEY=your_key node src/update-prices.js
+ * Cost formula:  cost = dwt × pricePerDWT × markup
  *
- * Requires:
- *   npm install   (installs node-fetch)
+ * Usage:  STULLER_USER=x STULLER_PASS=y node src/update-prices.js
  */
 
 import fetch from 'node-fetch';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { products, PURITY, TROY_OZ_TO_GRAMS } from './products.js';
+import { products, DEFAULT_MARKUP } from './products.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -25,56 +22,42 @@ const ROOT = path.join(__dirname, '..');
 // ---------------------------------------------------------------------------
 // Load env
 // ---------------------------------------------------------------------------
-const GOLDAPI_KEY = process.env.GOLDAPI_KEY;
-if (!GOLDAPI_KEY) {
-  console.error('ERROR: GOLDAPI_KEY environment variable is not set.');
-  console.error('Copy .env.example to .env and add your key, then run: node src/update-prices.js');
+const STULLER_USER = process.env.STULLER_USER;
+const STULLER_PASS = process.env.STULLER_PASS;
+
+if (!STULLER_USER || !STULLER_PASS) {
+  console.error('ERROR: STULLER_USER and STULLER_PASS environment variables must be set.');
+  console.error('Copy .env.example to .env, fill in your credentials, then run: source .env && npm run update');
   process.exit(1);
 }
 
+const STULLER_AUTH = 'Basic ' + Buffer.from(`${STULLER_USER}:${STULLER_PASS}`).toString('base64');
+
 // ---------------------------------------------------------------------------
-// Fetch spot price from goldapi.io
-// symbol: 'XAU' (gold) or 'XAG' (silver)
-// Returns price in USD per troy oz
+// Fetch a single SKU from Stuller
+// Returns { pricePerDWT, metalMarkets }
 // ---------------------------------------------------------------------------
-async function fetchSpotPrice(symbol) {
-  const url = `https://www.goldapi.io/api/${symbol}/USD`;
+async function fetchSKU(sku) {
+  const url = `https://api.stuller.com/v2/products?SKU=${encodeURIComponent(sku)}`;
   const res = await fetch(url, {
-    headers: {
-      'x-access-token': GOLDAPI_KEY,
-      'Content-Type': 'application/json',
-    },
+    headers: { Authorization: STULLER_AUTH },
   });
 
   if (!res.ok) {
-    throw new Error(`goldapi.io error for ${symbol}: ${res.status} ${res.statusText}`);
+    throw new Error(`Stuller API error for SKU ${sku}: ${res.status} ${res.statusText}`);
   }
 
   const data = await res.json();
+  const product = data.Products?.[0];
 
-  // goldapi.io returns { price: number, ... }
-  if (typeof data.price !== 'number') {
-    throw new Error(`Unexpected response from goldapi.io for ${symbol}: ${JSON.stringify(data)}`);
+  if (!product) {
+    throw new Error(`No product returned for SKU: ${sku}`);
   }
 
-  return data.price;
-}
-
-// ---------------------------------------------------------------------------
-// Calculate material cost for a single ring
-// ---------------------------------------------------------------------------
-function calcMaterialCost(ring, goldSpot, silverSpot) {
-  const purity = PURITY[ring.metalType];
-  let spotPerOz;
-
-  if (ring.metalType === 'silver') {
-    spotPerOz = silverSpot;
-  } else {
-    spotPerOz = goldSpot;
-  }
-
-  const pricePerGram = (spotPerOz / TROY_OZ_TO_GRAMS) * purity;
-  return Math.round(ring.grams * pricePerGram);
+  return {
+    pricePerDWT:  product.Price.Value,
+    metalMarkets: data.MetalMarkets,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -100,39 +83,45 @@ function formatDate(date) {
 }
 
 // ---------------------------------------------------------------------------
-// Build HTML table rows
-// ---------------------------------------------------------------------------
-function buildTableRows(goldSpot, silverSpot) {
-  return products
-    .map((ring) => {
-      const cost = calcMaterialCost(ring, goldSpot, silverSpot);
-      return `      <tr>
-        <td>${ring.width}</td>
-        <td class="metal-col">${ring.metal}</td>
-        <td>${ring.profile}</td>
-        <td class="price-col" data-sort="${cost}">${formatRange(cost, ring.metalType === 'silver' ? 50 : 100)}</td>
-        <td class="price-col" data-sort="${cost}">${formatUSD(cost)}</td>
-      </tr>`;
-    })
-    .join('\n');
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 async function main() {
-  console.log('Fetching spot prices from goldapi.io…');
+  console.log('Fetching Stuller prices…');
 
-  const [goldSpot, silverSpot] = await Promise.all([
-    fetchSpotPrice('XAU'),
-    fetchSpotPrice('XAG'),
-  ]);
+  // Fetch all SKUs in parallel
+  const results = await Promise.all(
+    products.map((ring) => fetchSKU(ring.sku))
+  );
 
-  console.log(`  Gold:   $${goldSpot.toFixed(2)}/oz`);
-  console.log(`  Silver: $${silverSpot.toFixed(2)}/oz`);
+  // Pull gold/silver spot from the first response (same for all)
+  const metalMarkets = results[0].metalMarkets;
+  const goldSpot   = metalMarkets.find((m) => m.Type === 'Gold')?.Rate ?? 0;
+  const silverSpot = metalMarkets.find((m) => m.Type === 'Silver')?.Rate ?? 0;
+
+  // Build table rows
+  const tableRows = products.map((ring, i) => {
+    const { pricePerDWT } = results[i];
+    const markup = ring.markup ?? DEFAULT_MARKUP;
+    const cost = ring.dwt !== null ? Math.round(ring.dwt * pricePerDWT * markup) : null;
+    const issilver = ring.metal.toLowerCase().includes('silver');
+
+    if (cost !== null) {
+      console.log(`  ${ring.metal} ${ring.width} ${ring.profile}: $${pricePerDWT}/DWT × ${ring.dwt} DWT = $${cost}`);
+    } else {
+      console.log(`  ${ring.metal} ${ring.width} ${ring.profile}: DWT not set — skipping`);
+    }
+
+    const displayRange = cost !== null ? formatRange(cost, issilver ? 50 : 100) : '—';
+    const sortVal      = cost !== null ? cost : -1;
+    return `      <tr>
+        <td>${ring.width}</td>
+        <td class="metal-col">${ring.metal}</td>
+        <td>${ring.profile}</td>
+        <td class="price-col" data-sort="${sortVal}">${displayRange}</td>
+      </tr>`;
+  }).join('\n');
 
   const today = new Date();
-  const tableRows = buildTableRows(goldSpot, silverSpot);
 
   // Read template
   const templatePath = path.join(__dirname, 'template.html');
@@ -149,19 +138,12 @@ async function main() {
   const outputDir = path.join(ROOT, 'output');
   fs.mkdirSync(outputDir, { recursive: true });
 
-  const outputPath = path.join(outputDir, 'quote-table.html');
-  fs.writeFileSync(outputPath, html, 'utf8');
-  console.log(`\nWrote: output/quote-table.html`);
+  fs.writeFileSync(path.join(outputDir, 'quote-table.html'), html, 'utf8');
+  console.log('\nWrote: output/quote-table.html');
 
-  // Write metadata sidecar
-  const meta = {
-    updatedAt: today.toISOString(),
-    goldSpotUSD: goldSpot,
-    silverSpotUSD: silverSpot,
-  };
   fs.writeFileSync(
     path.join(outputDir, 'last-updated.json'),
-    JSON.stringify(meta, null, 2) + '\n',
+    JSON.stringify({ updatedAt: today.toISOString(), goldSpotUSD: goldSpot, silverSpotUSD: silverSpot }, null, 2) + '\n',
     'utf8'
   );
   console.log('Wrote: output/last-updated.json');

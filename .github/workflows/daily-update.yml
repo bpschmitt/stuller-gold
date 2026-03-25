@@ -30,7 +30,9 @@ jobs:
       - name: Fetch prices and regenerate table
         run: node src/update-prices.js
         env:
-          GOLDAPI_KEY: ${{ secrets.GOLDAPI_KEY }}
+          STULLER_USER: ${{ secrets.STULLER_USER }}
+          STULLER_PASS: ${{ secrets.STULLER_PASS }}
+          NODE_TLS_REJECT_UNAUTHORIZED: '0'
 
       - name: Commit updated files
         run: |
