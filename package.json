@@ -1,0 +1,12 @@
+{
+  "name": "stuller-gold",
+  "version": "1.0.0",
+  "description": "Daily gold ring price quote table for Squarespace embed",
+  "type": "module",
+  "scripts": {
+    "update": "node src/update-prices.js"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
+}
